@@ -7,10 +7,16 @@
 # real bottle. Non-interactive by design, so it also works inside container image
 # builds and CI.
 #
+#   curl -fsSL https://raw.githubusercontent.com/tatianawallace772-arch/picobrew/main/picobrew-install-images.sh | bash
 #   ./picobrew-install-images.sh                 # build from this checkout, install
 #   ./picobrew-install-images.sh --verify        # ...and prove it: install + run jq
 #   ./picobrew-install-images.sh --prefix ~/hb   # custom prefix
 #   ./picobrew-install-images.sh --dry-run       # show the plan, touch nothing
+#   ./picobrew-install-images.sh --src DIR       # use an existing checkout
+#   ./picobrew-install-images.sh --from-git URL  # clone source to a temporary dir
+#   ./picobrew-install-images.sh --bin-dir DIR   # choose where binary is installed
+#   ./picobrew-install-images.sh --no-index     # skip index download
+#   ./picobrew-install-images.sh --jobs N        # set cargo build parallelism
 #
 # Exit codes: 0 ok, 1 failure, 2 bad usage, 3 unsupported platform/toolchain.
 #
@@ -32,10 +38,24 @@ step()  { printf '%s==>%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
 ok()    { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 info()  { printf '  %s·%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
 warn()  { printf '  %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-die()   { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit "${2:-1}"; }
+die()   { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$1" >&2; exit "${2:-1}"; }
 
 usage() {
-  sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'USAGE'
+Install picobrew from this checkout or a Git repository.
+Usage: bash picobrew-install-images.sh [options]
+  --prefix DIR     Installation prefix
+  --bin-dir DIR    Directory for the picobrew executable
+  --src DIR        Build from an existing checkout
+  --from-git URL   Clone a source repository to a temporary directory
+  --no-index       Skip warming the formula index
+  --verify         Install a jq bottle and verify it runs
+  --dry-run        Show the plan without making changes
+  -j, --jobs N     Number of Cargo build jobs
+  -q, --quiet      Reduce installer messages
+  -h, --help       Show this help
+When piped into bash, the public picobrew repository is cloned by default.
+USAGE
 }
 
 # ---------------------------------------------------------------------- config
@@ -48,33 +68,51 @@ JOBS=''
 DO_INDEX=1
 DO_VERIFY=0
 DRY_RUN=0
-ASSUME_YES=0
 QUIET=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix)      PREFIX_OPT="${2:?--prefix needs a directory}"; shift 2 ;;
-    --prefix=*)    PREFIX_OPT="${1#*=}"; shift ;;
+    --prefix=*)    PREFIX_OPT="${1#*=}"; [ -n "$PREFIX_OPT" ] || die "--prefix needs a directory" 2; shift ;;
     --bin-dir)     BIN_DIR_OPT="${2:?--bin-dir needs a directory}"; shift 2 ;;
-    --bin-dir=*)   BIN_DIR_OPT="${1#*=}"; shift ;;
+    --bin-dir=*)   BIN_DIR_OPT="${1#*=}"; [ -n "$BIN_DIR_OPT" ] || die "--bin-dir needs a directory" 2; shift ;;
     --src)         SRC_DIR="${2:?--src needs a directory}"; shift 2 ;;
-    --src=*)       SRC_DIR="${1#*=}"; shift ;;
+    --src=*)       SRC_DIR="${1#*=}"; [ -n "$SRC_DIR" ] || die "--src needs a directory" 2; shift ;;
     --from-git)    GIT_URL="${2:?--from-git needs a URL}"; shift 2 ;;
-    --from-git=*)  GIT_URL="${1#*=}"; shift ;;
+    --from-git=*)  GIT_URL="${1#*=}"; [ -n "$GIT_URL" ] || die "--from-git needs a URL" 2; shift ;;
     -j|--jobs)     JOBS="${2:?--jobs needs a number}"; shift 2 ;;
-    --jobs=*)      JOBS="${1#*=}"; shift ;;
+    --jobs=*)      JOBS="${1#*=}"; [ -n "$JOBS" ] || die "--jobs needs a number" 2; shift ;;
     --no-index)    DO_INDEX=0; shift ;;
     --verify)      DO_VERIFY=1; shift ;;
     --dry-run)     DRY_RUN=1; shift ;;
-    -y|--yes)      ASSUME_YES=1; shift ;;
     -q|--quiet)    QUIET=1; shift ;;
     -h|--help)     usage; exit 0 ;;
     *)             die "unknown argument: $1 (try --help)" 2 ;;
   esac
 done
 
-# Where this script lives: the checkout to build, unless --src/--from-git says otherwise.
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# HOME is needed for Rust and picobrew state. Fail clearly instead of relying
+# on an unbound or empty HOME and accidentally constructing paths under /.
+if [ -z "${HOME:-}" ]; then
+  die "HOME is unset or empty; set HOME to your home directory before running the installer" 2
+fi
+if [ ! -d "$HOME" ]; then
+  die "HOME is not an existing directory: $HOME" 2
+fi
+PATH=${PATH:-/usr/local/bin:/usr/bin:/bin}
+export PATH
+
+# A script read from stdin has no source file; clone instead of treating the
+# caller's working directory as a checkout.
+SCRIPT_FILE=${BASH_SOURCE[0]:-}
+SCRIPT_DIR=''
+if [ -n "$SCRIPT_FILE" ] && [ -f "$SCRIPT_FILE" ]; then
+  SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_FILE")" && pwd)
+fi
+DEFAULT_GIT_URL='https://github.com/tatianawallace772-arch/picobrew.git'
+if [ -z "$GIT_URL" ] && [ -z "$SRC_DIR" ] && { [ -z "$SCRIPT_DIR" ] || [ ! -f "$SCRIPT_DIR/Cargo.toml" ]; }; then
+  GIT_URL=$DEFAULT_GIT_URL
+fi
 
 run() { # run <cmd...> — echo under --dry-run, execute otherwise
   if [ "$DRY_RUN" = 1 ]; then
@@ -86,7 +124,7 @@ run() { # run <cmd...> — echo under --dry-run, execute otherwise
 
 T0=$SECONDS
 TMPDIR_PB=''
-cleanup() { [ -n "$TMPDIR_PB" ] && rm -rf "$TMPDIR_PB"; }
+cleanup() { if [ -n "${TMPDIR_PB:-}" ]; then rm -rf "$TMPDIR_PB"; fi; }
 trap cleanup EXIT
 
 elapsed() { echo "$(( SECONDS - T0 ))s"; }
@@ -139,7 +177,7 @@ fi
 # Normalise: expand a leading ~ and make absolute.
 case "$PREFIX" in "~") PREFIX=$HOME ;; "~/"*) PREFIX="$HOME/${PREFIX#\~/}" ;; esac
 case "$PREFIX" in /*) ;; *) PREFIX="$PWD/$PREFIX" ;; esac
-PREFIX=${PREFIX%/}
+if [ "$PREFIX" != / ]; then PREFIX=${PREFIX%/}; fi
 
 # writable_or_creatable <dir>
 writable_or_creatable() {
@@ -153,22 +191,23 @@ writable_or_creatable() {
 IS_ROOT=0; [ "$(id -u)" = 0 ] && IS_ROOT=1
 
 if ! writable_or_creatable "$PREFIX"; then
-  if [ "$IS_ROOT" = 1 ] || [ "$ASSUME_YES" = 1 ] && [ -n "$PREFIX_OPT" ]; then
-    :
-  else
-    FALLBACK="$HOME/.picobrew/prefix"
+  if [ "$IS_ROOT" = 0 ]; then
+    if [ -n "$PREFIX_OPT" ] || [ -n "${PICOBREW_PREFIX:-}" ]; then
+      die "requested prefix is not writable: $PREFIX" 1
+    fi
+    FALLBACK="$HOME/.pb"
     warn "default prefix $PREFIX is not writable by $(id -un)"
-    warn "falling back to $FALLBACK for this install"
-    warn "export PICOBREW_PREFIX=\"$FALLBACK\" (or rerun with sudo) to use $PREFIX"
+    warn "falling back to $FALLBACK; set PICOBREW_PREFIX to use it later"
     PREFIX=$FALLBACK
   fi
 fi
 
 # Homebrew bottles hard-code the build cellared path; relocation must fit in the
 # original slot. Very long prefixes can make some ELF patches impossible.
-if [ "${#PREFIX}" -gt 40 ]; then
-  warn "prefix is ${#PREFIX} bytes long; long prefixes can exceed ELF relocation slots"
-  warn "(picobrew refuses such files rather than corrupting them — see README)"
+PREFIX_BYTES=$(LC_ALL=C printf '%s' "$PREFIX" | wc -c | tr -d ' ')
+if [ "$OS" = Linux ] && [ "$PREFIX_BYTES" -gt 19 ]; then
+  warn "prefix is $PREFIX_BYTES bytes; some Linux bottles require a prefix of at most 19 bytes"
+  warn "those bottles will fail to install; consider a shorter --prefix"
 fi
 
 BIN_DIR=${BIN_DIR_OPT:-}
@@ -183,27 +222,36 @@ ok "binary: $BIN_DIR/picobrew"
 
 # --------------------------------------------------------------------- source
 
+if [ -n "$GIT_URL" ] && [ -n "$SRC_DIR" ]; then
+  die "--src and --from-git cannot be combined" 2
+fi
 if [ -n "$GIT_URL" ]; then
   need_cmd git
-  SRC="$SCRIPT_DIR/.picobrew-build"
-  step "source: clone $GIT_URL"
-  run rm -rf "$SRC"
-  run git clone --depth 1 --quiet "$GIT_URL" "$SRC"
+  if [ "$DRY_RUN" = 1 ]; then
+    SRC="<temporary checkout>"
+    info "would clone $GIT_URL into a temporary directory"
+  else
+    TMPDIR_PB=$(mktemp -d)
+    SRC="$TMPDIR_PB/source"
+    step "source: clone $GIT_URL"
+    git clone --depth 1 -- "$GIT_URL" "$SRC" || die "git clone failed"
+  fi
 elif [ -n "$SRC_DIR" ]; then
   SRC=$(CDPATH= cd -- "$SRC_DIR" && pwd) || die "--src directory not found: $SRC_DIR" 2
 else
   SRC=$SCRIPT_DIR
 fi
-
-[ -f "$SRC/Cargo.toml" ] || die "no Cargo.toml in $SRC — run this script from the picobrew checkout, or pass --src/--from-git" 2
+if [ "$DRY_RUN" != 1 ] || [ -z "$GIT_URL" ]; then
+  [ -f "$SRC/Cargo.toml" ] || die "no Cargo.toml in $SRC — the repository must contain Cargo.toml and src/ at its root, or pass --src" 2
+fi
 ok "source: $SRC"
 
 # ------------------------------------------------------------------ toolchain
 
 cargo_ok=0
 if command -v cargo >/dev/null 2>&1; then
-  have=$(rustc --version 2>/dev/null | awk '{print $2}')
-  if [ -n "$have" ] && [ "$(printf '%s\n1.89\n' "$have" | sort -V | head -n1)" = "1.89" ]; then
+  have=$(rustc --version 2>/dev/null | awk '{print $2}') || have=''
+  if printf '%s\n' "$have" | awk -F. '{ exit !($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && ($1 > 1 || ($1 == 1 && $2 >= 89))) }'; then
     cargo_ok=1
   else
     warn "rustc ${have:-unknown} is older than the required 1.89"
@@ -217,15 +265,15 @@ if [ "$cargo_ok" = 0 ]; then
   else
     export RUSTUP_HOME="${PICOBREW_RUSTUP_HOME:-$HOME/.rustup}"
     export CARGO_HOME="${PICOBREW_CARGO_HOME:-$HOME/.cargo}"
-    TMPDIR_PB=$(mktemp -d)
+    if [ -z "$TMPDIR_PB" ]; then TMPDIR_PB=$(mktemp -d); fi
     curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 \
       https://sh.rustup.rs -o "$TMPDIR_PB/rustup-init.sh" \
       || die "could not download rustup-init"
     head -c 400 "$TMPDIR_PB/rustup-init.sh" | grep -qi 'rust\|#!/bin/sh' \
       || die "rustup-init.sh does not look like a shell script; refusing to run it"
     sh "$TMPDIR_PB/rustup-init.sh" -y --no-modify-path --profile minimal \
-      --default-toolchain stable >/dev/null 2>&1 \
-      || die "rustup install failed"
+      --default-toolchain stable \
+      || die "rustup install failed (see output above)"
     PATH="$CARGO_HOME/bin:$PATH"; export PATH
     ok "rustc $(rustc --version | awk '{print $2}') at $CARGO_HOME"
   fi
@@ -239,9 +287,11 @@ step "build: cargo build --release"
 BUILD_ARGS=(build --release --manifest-path "$SRC/Cargo.toml")
 [ -f "$SRC/Cargo.lock" ] && BUILD_ARGS+=(--locked)
 case "$JOBS" in
-  ''|*[!0-9]*) ;;
+  '') ;;
+  *[!0-9]*|0) die "--jobs must be a positive integer" 2 ;;
   *) BUILD_ARGS+=(--jobs "$JOBS") ;;
 esac
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SRC/target}"
 
 if [ "$DRY_RUN" = 1 ]; then
   run cargo "${BUILD_ARGS[@]}"
@@ -251,7 +301,7 @@ else
   [[ "$QUIET" = 1 ]] || ok "built in $(( SECONDS - build_start ))s"
 fi
 
-BINARY="$SRC/target/release/picobrew"
+BINARY="$CARGO_TARGET_DIR/release/picobrew"
 if [ "$DRY_RUN" = 0 ]; then
   [ -x "$BINARY" ] || die "build finished but $BINARY is missing"
   ok "binary $(human_bytes "$(wc -c < "$BINARY" | tr -d ' ')")"
@@ -320,11 +370,10 @@ if [ "$DO_VERIFY" = 1 ]; then
       if [ "$jq_ver" = "6" ]; then
         ok "real bottle installed, relocated, and executing"
       else
-        warn "jq installed but did not produce the expected output (got: ${jq_ver:-nothing})"
-        warn "run: $BIN_DIR/picobrew --prefix $PREFIX doctor"
+        die "jq installed but verification failed (output: ${jq_ver:-nothing}); run $PREFIX/bin/jq to inspect the error"
       fi
     else
-      warn "verification install failed — the binary is installed; inspect with doctor"
+      die "verification install failed — the picobrew binary remains installed"
     fi
   fi
 fi
@@ -339,10 +388,14 @@ fi
 # ------------------------------------------------------------------ summary
 
 echo
-printf '%s%s installed%s\n' "$C_BOLD" 'picobrew' "$C_RESET"
+if [ "$DRY_RUN" = 1 ]; then
+  printf '%s%s would be installed%s\n' "$C_BOLD" 'picobrew' "$C_RESET"
+else
+  printf '%s%s installed%s\n' "$C_BOLD" 'picobrew' "$C_RESET"
+fi
 info "binary   $BIN_DIR/picobrew"
 info "prefix   $PREFIX"
-info "cache    ${PICOBREW_HOME:-${XDG_CACHE_HOME:-${HOME:-~}/.picobrew}}"
+info "cache    ${PICOBREW_HOME:-$HOME/.picobrew}"
 info "elapsed  $(elapsed)"
 
 case ":$PATH:" in
